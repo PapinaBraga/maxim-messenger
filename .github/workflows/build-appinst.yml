@@ -30,9 +30,13 @@ jobs:
 
       - name: Fetch static libzip used by official appinst build
         run: |
-          curl -fL --retry 4 --retry-delay 3 \
+          # BigBoss currently serves this legacy package with an expired TLS cert.
+          # The URL is the one documented by the official appinst README.
+          curl -fkL --retry 4 --retry-delay 3 \
             https://apt.thebigboss.org/repofiles/cydia/debs2.0/libzip_0.11.2.deb \
             -o /tmp/libzip.deb
+          test "$(dpkg-deb -f /tmp/libzip.deb Package)" = "libzip"
+          test "$(dpkg-deb -f /tmp/libzip.deb Version)" = "0.11.2"
           mkdir -p /tmp/libzip
           dpkg-deb -x /tmp/libzip.deb /tmp/libzip
           LIBZIP="$(find /tmp/libzip -name libzip.a -type f | head -1)"
