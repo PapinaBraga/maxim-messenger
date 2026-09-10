@@ -1,0 +1,50 @@
+name: iOS 12 unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/ios12-audio-calls
+
+jobs:
+  build-ios12:
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter 3.29.3
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.3'
+          channel: stable
+          cache: true
+
+      - name: Flutter dependencies
+        run: flutter pub get
+
+      - name: CocoaPods dependencies
+        run: |
+          cd ios
+          pod install --repo-update
+
+      - name: Build iOS without signing
+        run: flutter build ios --release --no-codesign
+
+      - name: Pack unsigned IPA
+        run: |
+          rm -rf Payload maxim-ios12-unsigned.ipa
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qry maxim-ios12-unsigned.ipa Payload
+          ls -lh maxim-ios12-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: maxim-ios12-unsigned
+          path: maxim-ios12-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
