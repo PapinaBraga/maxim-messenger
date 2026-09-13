@@ -1,4 +1,4 @@
-name: iOS 12 unsigned IPA
+name: iOS 12 ad-hoc IPA
 
 on:
   workflow_dispatch:
@@ -30,21 +30,53 @@ jobs:
           cd ios
           pod install --repo-update
 
-      - name: Build iOS without signing
+      - name: Build iOS without Apple signing
         run: flutter build ios --release --no-codesign
 
-      - name: Pack unsigned IPA
+      - name: Add ad-hoc signature and application identifier
+        shell: bash
         run: |
-          rm -rf Payload maxim-ios12-unsigned.ipa
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          cat > /tmp/maxim-entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>application-identifier</key>
+            <string>one.maxim.maximMessenger</string>
+            <key>get-task-allow</key>
+            <false/>
+          </dict>
+          </plist>
+          EOF
+
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -type d -name '*.framework' -print0 | while IFS= read -r -d '' item; do
+              /usr/bin/codesign --force --sign - --timestamp=none "$item"
+            done
+            find "$APP/Frameworks" -type f -name '*.dylib' -print0 | while IFS= read -r -d '' item; do
+              /usr/bin/codesign --force --sign - --timestamp=none "$item"
+            done
+          fi
+
+          /usr/bin/codesign --force --sign - --timestamp=none --entitlements /tmp/maxim-entitlements.plist "$APP"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
+          /usr/bin/codesign -d --entitlements :- "$APP" 2>&1 | tee /tmp/final-entitlements.txt
+          grep -q 'application-identifier' /tmp/final-entitlements.txt
+
+      - name: Pack IPA
+        run: |
+          rm -rf Payload Maxim-iOS12-adhoc.ipa
           mkdir -p Payload
           cp -R build/ios/iphoneos/Runner.app Payload/
-          zip -qry maxim-ios12-unsigned.ipa Payload
-          ls -lh maxim-ios12-unsigned.ipa
+          zip -qry Maxim-iOS12-adhoc.ipa Payload
+          ls -lh Maxim-iOS12-adhoc.ipa
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: maxim-ios12-unsigned
-          path: maxim-ios12-unsigned.ipa
+          name: Maxim-iOS12-adhoc
+          path: Maxim-iOS12-adhoc.ipa
           if-no-files-found: error
           retention-days: 14
