@@ -22,6 +22,20 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Patch SQLite syntax for iOS 12
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('lib/data/local/database.dart')
+          text = p.read_text()
+          old = 'last_message_time_ms DESC NULLS LAST'
+          count = text.count(old)
+          if count != 2:
+              raise SystemExit(f'Expected 2 NULLS LAST occurrences, found {count}')
+          p.write_text(text.replace(old, 'last_message_time_ms DESC'))
+          PY
+
       - name: Flutter dependencies
         run: flutter pub get
 
