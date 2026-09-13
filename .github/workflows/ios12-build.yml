@@ -42,30 +42,17 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          # MAX op 49 uses a timestamp cursor and backward count for recent/older
-          # history. The branch implementation was using a message id as `from`
-          # and `forward`, which produces an empty history on current servers.
+          # Patch chatHistory by function markers instead of matching exact
+          # whitespace/formatting, which is brittle after dartfmt changes.
           p = Path('lib/data/max/max_client.dart')
           text = p.read_text()
-          old = """  Future<List<Map<String, dynamic>>> chatHistory(
-            int chatId, {
-            int fromId = 0,
-            int count = 50,
-          }) async {
-            final f = await _request(MaxOp.chatHistory, {
-              'chatId': chatId,
-              'from': fromId,
-              'forward': count,
-            });
-            if (f.cmd != 1) throw MaxError('chatHistory cmd=${f.cmd}');
-            final m = _asMap(f.decoded);
-            final msgs = m['messages'];
-            if (msgs is List) {
-              return msgs.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
-            }
-            return _parseMessagesRaw(f.body);
-          }"""
-          new = """  Future<List<Map<String, dynamic>>> chatHistory(
+          start_marker = '  Future<List<Map<String, dynamic>>> chatHistory('
+          end_marker = '\n\n  Future<Map<String, dynamic>> currentProfile()'
+          start = text.find(start_marker)
+          end = text.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit('chatHistory markers not found')
+          new_history = """  Future<List<Map<String, dynamic>>> chatHistory(
             int chatId, {
             int? fromTime,
             int count = 50,
@@ -86,37 +73,34 @@ jobs:
             final m = _asMap(f.decoded);
             final msgs = m['messages'];
             if (msgs is List) {
-              return msgs.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
+              return msgs
+                  .whereType<Map>()
+                  .map((e) => e.cast<String, dynamic>())
+                  .toList();
             }
             return _parseMessagesRaw(f.body);
           }"""
-          if old not in text:
-              raise SystemExit('chatHistory block not found')
-          p.write_text(text.replace(old, new, 1))
+          p.write_text(text[:start] + new_history + text[end:])
 
           p = Path('lib/data/repositories/messages_repository.dart')
           text = p.read_text()
+
+          # syncHistory: request recent messages using a time cursor.
           text = text.replace(
               'fromId: 0,',
               'fromTime: DateTime.now().millisecondsSinceEpoch,',
           )
-          old_load = """      final oldest = await db.oldestServerMessageId(chatId);
-              if (oldest == null) {
-                // локально пусто — нечего пагинировать, имеет смысл только обычный sync
-                return await _fetchAndStore(
-                  chatId,
-                  fromTime: DateTime.now().millisecondsSinceEpoch,
-                  count: count,
-                  updatePreview: true,
-                );
-              }
-              return await _fetchAndStore(
-                chatId,
-                fromId: oldest,
-                count: count,
-                updatePreview: false,
-              );"""
-          new_load = """      final local = await localHistory(chatId);
+
+          # Replace loadOlder as a whole, so we do not depend on exact comments.
+          start_marker = '  Future<List<MaxMessage>> loadOlder('
+          end_marker = '\n\n  Future<List<MaxMessage>> _fetchAndStore('
+          start = text.find(start_marker)
+          end = text.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit('loadOlder markers not found')
+          new_load_older = """  Future<List<MaxMessage>> loadOlder(int chatId, {int count = 50}) async {
+            try {
+              final local = await localHistory(chatId);
               final fromTime = local.isEmpty
                   ? DateTime.now().millisecondsSinceEpoch
                   : local.first.timeMs - 1;
@@ -125,17 +109,26 @@ jobs:
                 fromTime: fromTime,
                 count: count,
                 updatePreview: local.isEmpty,
-              );"""
-          if old_load not in text:
-              raise SystemExit('loadOlder block not found')
-          text = text.replace(old_load, new_load, 1)
+              );
+            } on MaxNotConnected catch (e) {
+              _log.i('loadOlder skipped (offline): $e');
+              return localHistory(chatId);
+            } on MaxTimeout catch (e) {
+              _log.i('loadOlder skipped (timeout): $e');
+              return localHistory(chatId);
+            }
+          }"""
+          text = text[:start] + new_load_older + text[end:]
+
           if 'required int fromId,' not in text:
               raise SystemExit('_fetchAndStore fromId signature not found')
           text = text.replace('required int fromId,', 'required int fromTime,', 1)
-          if 'client.chatHistory(reqChatId, fromId: fromId, count: count)' not in text:
+
+          old_call = 'client.chatHistory(reqChatId, fromId: fromId, count: count)'
+          if old_call not in text:
               raise SystemExit('chatHistory call not found')
           text = text.replace(
-              'client.chatHistory(reqChatId, fromId: fromId, count: count)',
+              old_call,
               'client.chatHistory(reqChatId, fromTime: fromTime, count: count)',
               1,
           )
