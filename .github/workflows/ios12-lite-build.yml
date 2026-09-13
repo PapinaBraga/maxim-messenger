@@ -1,0 +1,153 @@
+name: iOS 12 lite IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/ios12-audio-calls
+
+jobs:
+  build-ios12-lite:
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Flutter 3.29.3
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.3'
+          channel: stable
+          cache: true
+
+      - name: Prepare temporary lite build
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep the real call implementation in the branch, but exclude it
+          # from this temporary IPA while we debug login on iPhone 5s.
+          git show origin/master:lib/ui/screens/calls_list_screen.dart > lib/ui/screens/calls_list_screen.dart
+          rm -f lib/data/calls/max_audio_call.dart lib/ui/screens/audio_call_screen.dart
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('pubspec.yaml')
+          lines = p.read_text().splitlines()
+          lines = [line for line in lines if not line.strip().startswith('flutter_webrtc:')]
+          p.write_text('\n'.join(lines) + '\n')
+          PY
+
+      - name: Flutter dependencies
+        run: flutter pub get
+
+      - name: CocoaPods dependencies
+        run: |
+          cd ios
+          pod install --repo-update
+
+      - name: Show detailed AUTH_REQUEST errors
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('lib/data/max/max_client.dart')
+          text = p.read_text()
+          start_marker = '  Future<String> startAuthSms(String phone) async {'
+          end_marker = '\n\n  /// Возвращает (authToken, trackIdFor2fa). Один из двух непустой.'
+          start = text.find(start_marker)
+          if start < 0:
+              raise SystemExit('startAuthSms start marker not found')
+          end = text.find(end_marker, start)
+          if end < 0:
+              raise SystemExit('startAuthSms end marker not found')
+          new = """  Future<String> startAuthSms(String phone) async {
+            final f = await _request(MaxOp.authRequest, {
+              'phone': phone,
+              'type': 'START_AUTH',
+            });
+            if (f.cmd != 1) {
+              final d = f.decoded;
+              if (d is Map) {
+                final m = d.map((k, v) => MapEntry(k.toString(), v));
+                final details = <String>[];
+                for (final key in const ['error', 'message', 'localizedMessage', 'title']) {
+                  final value = m[key]?.toString();
+                  if (value != null && value.isNotEmpty) {
+                    details.add('$key=$value');
+                  }
+                }
+                if (details.isNotEmpty) {
+                  throw MaxLoginFailed(
+                    'AUTH_REQUEST cmd=${f.cmd}: ${details.join(' | ')}',
+                  );
+                }
+              }
+              final hex = f.body
+                  .take(96)
+                  .map((b) => b.toRadixString(16).padLeft(2, '0'))
+                  .join();
+              throw MaxLoginFailed(
+                'AUTH_REQUEST cmd=${f.cmd}; decoded=$d; bodyHex=$hex',
+              );
+            }
+            final t = RawParsers.findLongToken(f.body);
+            if (t == null) throw const MaxLoginFailed('verify token not extracted');
+            return t;
+          }"""
+          p.write_text(text[:start] + new + text[end:])
+          PY
+
+      - name: Build iOS without Apple signing
+        run: flutter build ios --release --no-codesign
+
+      - name: Add ad-hoc signature and application identifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          cat > /tmp/maxim-entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>application-identifier</key>
+            <string>one.maxim.maximMessenger</string>
+            <key>get-task-allow</key>
+            <false/>
+          </dict>
+          </plist>
+          EOF
+
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -type d -name '*.framework' -print0 | while IFS= read -r -d '' item; do
+              /usr/bin/codesign --force --sign - --timestamp=none "$item"
+            done
+            find "$APP/Frameworks" -type f -name '*.dylib' -print0 | while IFS= read -r -d '' item; do
+              /usr/bin/codesign --force --sign - --timestamp=none "$item"
+            done
+          fi
+
+          /usr/bin/codesign --force --sign - --timestamp=none --entitlements /tmp/maxim-entitlements.plist "$APP"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Pack compact IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf Payload Maxim-iOS12-lite.ipa
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -9qry Maxim-iOS12-lite.ipa Payload
+          ls -lh Maxim-iOS12-lite.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Maxim-iOS12-lite
+          path: Maxim-iOS12-lite.ipa
+          if-no-files-found: error
+          retention-days: 14
