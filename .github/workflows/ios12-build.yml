@@ -30,6 +30,65 @@ jobs:
           cd ios
           pod install --repo-update
 
+      - name: Show detailed AUTH_REQUEST errors
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('lib/data/max/max_client.dart')
+          text = p.read_text()
+          old = """  Future<String> startAuthSms(String phone) async {
+            final f = await _request(MaxOp.authRequest, {
+              'phone': phone,
+              'type': 'START_AUTH',
+            });
+            if (f.cmd != 1) throw MaxLoginFailed('AUTH_REQUEST cmd=${f.cmd}');
+            final t = RawParsers.findLongToken(f.body);
+            if (t == null) throw const MaxLoginFailed('verify token not extracted');
+            return t;
+          }
+          """
+          new = """  Future<String> startAuthSms(String phone) async {
+            final f = await _request(MaxOp.authRequest, {
+              'phone': phone,
+              'type': 'START_AUTH',
+            });
+            if (f.cmd != 1) {
+              final d = f.decoded;
+              if (d is Map) {
+                final m = d.map((k, v) => MapEntry(k.toString(), v));
+                final details = <String>[];
+                for (final key in const ['error', 'message', 'localizedMessage', 'title']) {
+                  final value = m[key]?.toString();
+                  if (value != null && value.isNotEmpty) {
+                    details.add('$key=$value');
+                  }
+                }
+                if (details.isNotEmpty) {
+                  throw MaxLoginFailed(
+                    'AUTH_REQUEST cmd=${f.cmd}: ${details.join(' | ')}',
+                  );
+                }
+              }
+              final hex = f.body
+                  .take(96)
+                  .map((b) => b.toRadixString(16).padLeft(2, '0'))
+                  .join();
+              throw MaxLoginFailed(
+                'AUTH_REQUEST cmd=${f.cmd}; decoded=$d; bodyHex=$hex',
+              );
+            }
+            final t = RawParsers.findLongToken(f.body);
+            if (t == null) throw const MaxLoginFailed('verify token not extracted');
+            return t;
+          }
+          """
+          if old not in text:
+              raise SystemExit('startAuthSms block not found; refusing blind patch')
+          p.write_text(text.replace(old, new, 1))
+          PY
+
       - name: Build iOS without Apple signing
         run: flutter build ios --release --no-codesign
 
