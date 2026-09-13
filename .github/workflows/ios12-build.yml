@@ -36,6 +36,112 @@ jobs:
           p.write_text(text.replace(old, 'last_message_time_ms DESC'))
           PY
 
+      - name: Patch MAX chat history request
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # MAX op 49 uses a timestamp cursor and backward count for recent/older
+          # history. The branch implementation was using a message id as `from`
+          # and `forward`, which produces an empty history on current servers.
+          p = Path('lib/data/max/max_client.dart')
+          text = p.read_text()
+          old = """  Future<List<Map<String, dynamic>>> chatHistory(
+            int chatId, {
+            int fromId = 0,
+            int count = 50,
+          }) async {
+            final f = await _request(MaxOp.chatHistory, {
+              'chatId': chatId,
+              'from': fromId,
+              'forward': count,
+            });
+            if (f.cmd != 1) throw MaxError('chatHistory cmd=${f.cmd}');
+            final m = _asMap(f.decoded);
+            final msgs = m['messages'];
+            if (msgs is List) {
+              return msgs.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
+            }
+            return _parseMessagesRaw(f.body);
+          }"""
+          new = """  Future<List<Map<String, dynamic>>> chatHistory(
+            int chatId, {
+            int? fromTime,
+            int count = 50,
+          }) async {
+            final cursor = fromTime ?? DateTime.now().millisecondsSinceEpoch;
+            final f = await _request(MaxOp.chatHistory, {
+              'chatId': chatId,
+              'from': cursor,
+              'forward': 0,
+              'backward': count,
+              'forwardTime': 0,
+              'backwardTime': 0,
+              'getChat': false,
+              'getMessages': true,
+              'interactive': false,
+            });
+            if (f.cmd != 1) throw MaxError('chatHistory cmd=${f.cmd}');
+            final m = _asMap(f.decoded);
+            final msgs = m['messages'];
+            if (msgs is List) {
+              return msgs.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
+            }
+            return _parseMessagesRaw(f.body);
+          }"""
+          if old not in text:
+              raise SystemExit('chatHistory block not found')
+          p.write_text(text.replace(old, new, 1))
+
+          p = Path('lib/data/repositories/messages_repository.dart')
+          text = p.read_text()
+          text = text.replace(
+              'fromId: 0,',
+              'fromTime: DateTime.now().millisecondsSinceEpoch,',
+          )
+          old_load = """      final oldest = await db.oldestServerMessageId(chatId);
+              if (oldest == null) {
+                // локально пусто — нечего пагинировать, имеет смысл только обычный sync
+                return await _fetchAndStore(
+                  chatId,
+                  fromTime: DateTime.now().millisecondsSinceEpoch,
+                  count: count,
+                  updatePreview: true,
+                );
+              }
+              return await _fetchAndStore(
+                chatId,
+                fromId: oldest,
+                count: count,
+                updatePreview: false,
+              );"""
+          new_load = """      final local = await localHistory(chatId);
+              final fromTime = local.isEmpty
+                  ? DateTime.now().millisecondsSinceEpoch
+                  : local.first.timeMs - 1;
+              return await _fetchAndStore(
+                chatId,
+                fromTime: fromTime,
+                count: count,
+                updatePreview: local.isEmpty,
+              );"""
+          if old_load not in text:
+              raise SystemExit('loadOlder block not found')
+          text = text.replace(old_load, new_load, 1)
+          if 'required int fromId,' not in text:
+              raise SystemExit('_fetchAndStore fromId signature not found')
+          text = text.replace('required int fromId,', 'required int fromTime,', 1)
+          if 'client.chatHistory(reqChatId, fromId: fromId, count: count)' not in text:
+              raise SystemExit('chatHistory call not found')
+          text = text.replace(
+              'client.chatHistory(reqChatId, fromId: fromId, count: count)',
+              'client.chatHistory(reqChatId, fromTime: fromTime, count: count)',
+              1,
+          )
+          p.write_text(text)
+          PY
+
       - name: Flutter dependencies
         run: flutter pub get
 
