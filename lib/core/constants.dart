@@ -3,11 +3,11 @@ class MaxProto {
   static const String host = 'api.oneme.ru';
   static const int port = 443;
   static const int protoVersion = 10;
-  static const String appVersion = '26.15.0';
+  static const String appVersion = '26.30.1';
 
-  /// versionCode официального APK (max_full.apk). Идёт в userAgent.buildNumber
-  /// и должен быть согласован с [appVersion] (26.15.0 → 6689).
-  static const int appBuild = 6689;
+  /// versionCode официального APK (ru.oneme.app). Идёт в userAgent.buildNumber
+  /// и должен быть согласован с [appVersion] (26.30.1 → 6819).
+  static const int appBuild = 6819;
   static const String deviceType = 'ANDROID';
   static const String locale = 'ru';
 
