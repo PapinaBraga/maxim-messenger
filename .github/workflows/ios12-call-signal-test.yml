@@ -1,0 +1,94 @@
+name: iOS 12 call signaling test IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/ios12-audio-calls
+
+jobs:
+  build-ios12-calltest:
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter 3.29.3
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.3'
+          channel: stable
+          cache: true
+
+      - name: Patch SQLite syntax for iOS 12
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('lib/data/local/database.dart')
+          text = p.read_text()
+          p.write_text(text.replace('last_message_time_ms DESC NULLS LAST', 'last_message_time_ms DESC'))
+          PY
+
+      - name: Patch MAX signaling to native protocol shape with diagnostics
+        run: python3 .github/scripts/patch_ios12_calltest.py
+
+      - name: Flutter dependencies
+        run: flutter pub get
+
+      - name: CocoaPods dependencies
+        run: |
+          cd ios
+          pod install --repo-update
+
+      - name: Build iOS without Apple signing
+        run: flutter build ios --release --no-codesign
+
+      - name: Add ad-hoc signature and application identifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          cat > /tmp/maxim-entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>application-identifier</key>
+            <string>one.maxim.maximMessenger</string>
+            <key>get-task-allow</key>
+            <false/>
+          </dict>
+          </plist>
+          EOF
+
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -type d -name '*.framework' -print0 | while IFS= read -r -d '' item; do
+              /usr/bin/codesign --force --sign - --timestamp=none "$item"
+            done
+            find "$APP/Frameworks" -type f -name '*.dylib' -print0 | while IFS= read -r -d '' item; do
+              /usr/bin/codesign --force --sign - --timestamp=none "$item"
+            done
+          fi
+
+          /usr/bin/codesign --force --sign - --timestamp=none --entitlements /tmp/maxim-entitlements.plist "$APP"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Pack IPA
+        shell: bash
+        run: |
+          rm -rf Payload Maxim-iOS12-calltest.ipa
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qry Maxim-iOS12-calltest.ipa Payload
+          ls -lh Maxim-iOS12-calltest.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Maxim-iOS12-calltest
+          path: Maxim-iOS12-calltest.ipa
+          if-no-files-found: error
+          retention-days: 14

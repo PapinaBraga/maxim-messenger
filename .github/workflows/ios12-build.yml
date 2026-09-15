@@ -1,0 +1,248 @@
+name: iOS 12 ad-hoc IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/ios12-audio-calls
+
+jobs:
+  build-ios12:
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter 3.29.3
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.3'
+          channel: stable
+          cache: true
+
+      - name: Patch SQLite syntax for iOS 12
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('lib/data/local/database.dart')
+          text = p.read_text()
+          old = 'last_message_time_ms DESC NULLS LAST'
+          count = text.count(old)
+          if count != 2:
+              raise SystemExit(f'Expected 2 NULLS LAST occurrences, found {count}')
+          p.write_text(text.replace(old, 'last_message_time_ms DESC'))
+          PY
+
+      - name: Patch MAX chat history request
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # Patch chatHistory by function markers instead of matching exact
+          # whitespace/formatting, which is brittle after dartfmt changes.
+          p = Path('lib/data/max/max_client.dart')
+          text = p.read_text()
+          start_marker = '  Future<List<Map<String, dynamic>>> chatHistory('
+          end_marker = '\n\n  Future<Map<String, dynamic>> currentProfile()'
+          start = text.find(start_marker)
+          end = text.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit('chatHistory markers not found')
+          new_history = """  Future<List<Map<String, dynamic>>> chatHistory(
+            int chatId, {
+            int? fromTime,
+            int count = 50,
+          }) async {
+            final cursor = fromTime ?? DateTime.now().millisecondsSinceEpoch;
+            final f = await _request(MaxOp.chatHistory, {
+              'chatId': chatId,
+              'from': cursor,
+              'forward': 0,
+              'backward': count,
+              'forwardTime': 0,
+              'backwardTime': 0,
+              'getChat': false,
+              'getMessages': true,
+              'interactive': false,
+            });
+            if (f.cmd != 1) throw MaxError('chatHistory cmd=${f.cmd}');
+            final m = _asMap(f.decoded);
+            final msgs = m['messages'];
+            if (msgs is List) {
+              return msgs
+                  .whereType<Map>()
+                  .map((e) => e.cast<String, dynamic>())
+                  .toList();
+            }
+            return _parseMessagesRaw(f.body);
+          }"""
+          p.write_text(text[:start] + new_history + text[end:])
+
+          p = Path('lib/data/repositories/messages_repository.dart')
+          text = p.read_text()
+
+          # syncHistory: request recent messages using a time cursor.
+          text = text.replace(
+              'fromId: 0,',
+              'fromTime: DateTime.now().millisecondsSinceEpoch,',
+          )
+
+          # Replace loadOlder as a whole, so we do not depend on exact comments.
+          start_marker = '  Future<List<MaxMessage>> loadOlder('
+          end_marker = '\n\n  Future<List<MaxMessage>> _fetchAndStore('
+          start = text.find(start_marker)
+          end = text.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit('loadOlder markers not found')
+          new_load_older = """  Future<List<MaxMessage>> loadOlder(int chatId, {int count = 50}) async {
+            try {
+              final local = await localHistory(chatId);
+              final fromTime = local.isEmpty
+                  ? DateTime.now().millisecondsSinceEpoch
+                  : local.first.timeMs - 1;
+              return await _fetchAndStore(
+                chatId,
+                fromTime: fromTime,
+                count: count,
+                updatePreview: local.isEmpty,
+              );
+            } on MaxNotConnected catch (e) {
+              _log.i('loadOlder skipped (offline): $e');
+              return localHistory(chatId);
+            } on MaxTimeout catch (e) {
+              _log.i('loadOlder skipped (timeout): $e');
+              return localHistory(chatId);
+            }
+          }"""
+          text = text[:start] + new_load_older + text[end:]
+
+          if 'required int fromId,' not in text:
+              raise SystemExit('_fetchAndStore fromId signature not found')
+          text = text.replace('required int fromId,', 'required int fromTime,', 1)
+
+          old_call = 'client.chatHistory(reqChatId, fromId: fromId, count: count)'
+          if old_call not in text:
+              raise SystemExit('chatHistory call not found')
+          text = text.replace(
+              old_call,
+              'client.chatHistory(reqChatId, fromTime: fromTime, count: count)',
+              1,
+          )
+          p.write_text(text)
+          PY
+
+      - name: Flutter dependencies
+        run: flutter pub get
+
+      - name: CocoaPods dependencies
+        run: |
+          cd ios
+          pod install --repo-update
+
+      - name: Show detailed AUTH_REQUEST errors
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('lib/data/max/max_client.dart')
+          text = p.read_text()
+          start_marker = '  Future<String> startAuthSms(String phone) async {'
+          end_marker = '\n\n  /// Возвращает (authToken, trackIdFor2fa). Один из двух непустой.'
+          start = text.find(start_marker)
+          if start < 0:
+              raise SystemExit('startAuthSms start marker not found')
+          end = text.find(end_marker, start)
+          if end < 0:
+              raise SystemExit('startAuthSms end marker not found')
+          new = """  Future<String> startAuthSms(String phone) async {
+            final f = await _request(MaxOp.authRequest, {
+              'phone': phone,
+              'type': 'START_AUTH',
+            });
+            if (f.cmd != 1) {
+              final d = f.decoded;
+              if (d is Map) {
+                final m = d.map((k, v) => MapEntry(k.toString(), v));
+                final details = <String>[];
+                for (final key in const ['error', 'message', 'localizedMessage', 'title']) {
+                  final value = m[key]?.toString();
+                  if (value != null && value.isNotEmpty) {
+                    details.add('$key=$value');
+                  }
+                }
+                if (details.isNotEmpty) {
+                  throw MaxLoginFailed(
+                    'AUTH_REQUEST cmd=${f.cmd}: ${details.join(' | ')}',
+                  );
+                }
+              }
+              final hex = f.body
+                  .take(96)
+                  .map((b) => b.toRadixString(16).padLeft(2, '0'))
+                  .join();
+              throw MaxLoginFailed(
+                'AUTH_REQUEST cmd=${f.cmd}; decoded=$d; bodyHex=$hex',
+              );
+            }
+            final t = RawParsers.findLongToken(f.body);
+            if (t == null) throw const MaxLoginFailed('verify token not extracted');
+            return t;
+          }"""
+          p.write_text(text[:start] + new + text[end:])
+          PY
+
+      - name: Build iOS without Apple signing
+        run: flutter build ios --release --no-codesign
+
+      - name: Add ad-hoc signature and application identifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          cat > /tmp/maxim-entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>application-identifier</key>
+            <string>one.maxim.maximMessenger</string>
+            <key>get-task-allow</key>
+            <false/>
+          </dict>
+          </plist>
+          EOF
+
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -type d -name '*.framework' -print0 | while IFS= read -r -d '' item; do
+              /usr/bin/codesign --force --sign - --timestamp=none "$item"
+            done
+            find "$APP/Frameworks" -type f -name '*.dylib' -print0 | while IFS= read -r -d '' item; do
+              /usr/bin/codesign --force --sign - --timestamp=none "$item"
+            done
+          fi
+
+          /usr/bin/codesign --force --sign - --timestamp=none --entitlements /tmp/maxim-entitlements.plist "$APP"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
+          /usr/bin/codesign -d --entitlements :- "$APP" 2>&1 | tee /tmp/final-entitlements.txt
+          grep -q 'application-identifier' /tmp/final-entitlements.txt
+
+      - name: Pack IPA
+        run: |
+          rm -rf Payload Maxim-iOS12-adhoc.ipa
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qry Maxim-iOS12-adhoc.ipa Payload
+          ls -lh Maxim-iOS12-adhoc.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Maxim-iOS12-adhoc
+          path: Maxim-iOS12-adhoc.ipa
+          if-no-files-found: error
+          retention-days: 14

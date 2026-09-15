@@ -50,7 +50,7 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Камера нужна для съёмки фото и видео при отправке в чат.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Микрофон нужен для голосовых сообщений.</string>
+	<string>Микрофон нужен для голосовых сообщений и аудиозвонков MAX.</string>
 	<key>NSContactsUsageDescription</key>
 	<string>Контакты нужны для поиска собеседников из адресной книги.</string>
 </dict>

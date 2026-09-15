@@ -2,12 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
+import '../../data/calls/max_audio_call.dart';
 import '../../data/local/database.dart';
+import '../../data/max/models/contact.dart';
 import '../../state/providers.dart';
+import 'audio_call_screen.dart';
 
-/// История звонков. WebRTC-вызовы не реализованы (опкоды реал-тайм медиа
-/// не реверснуты на момент 0.1.x), поэтому экран показывает локальный
-/// журнал и кнопку «новый звонок» с заглушкой.
+/// История звонков + первый рабочий сценарий исходящего аудиозвонка.
+/// Входящие и видео добавим после проверки end-to-end на iPhone 5s.
 class CallsListScreen extends ConsumerWidget {
   const CallsListScreen({super.key});
 
@@ -20,7 +22,7 @@ class CallsListScreen extends ConsumerWidget {
         actions: [
           IconButton(
             tooltip: 'Создать звонок',
-            onPressed: () => _showStub(context),
+            onPressed: () => _startNewCall(context, ref),
             icon: const Icon(Icons.add_call),
           ),
         ],
@@ -48,7 +50,7 @@ class CallsListScreen extends ConsumerWidget {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      'Голосовые и видеозвонки появятся в одном из следующих обновлений.',
+                      'Нажмите +, выберите контакт MAX и сделайте первый аудиозвонок.',
                       textAlign: TextAlign.center,
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
@@ -62,21 +64,27 @@ class CallsListScreen extends ConsumerWidget {
             separatorBuilder: (_, __) => const Divider(height: 0, indent: 72),
             itemBuilder: (_, i) {
               final row = rows[i];
+              final peerId = (row['peer_id'] as num?)?.toInt();
+              final peerName = (row['peer_name'] as String?) ??
+                  (peerId == null ? 'Контакт' : 'Контакт $peerId');
               return ListTile(
                 leading: CircleAvatar(
                   child: Text(
-                    ((row['peer_name'] as String?)?.isNotEmpty == true)
-                        ? (row['peer_name'] as String)[0].toUpperCase()
-                        : '?',
+                    peerName.isNotEmpty ? peerName[0].toUpperCase() : '?',
                   ),
                 ),
-                title: Text(
-                  (row['peer_name'] as String?) ??
-                      'Контакт ${row['peer_id'] ?? '?'}',
-                ),
+                title: Text(peerName),
                 subtitle: Text(_formatCallRow(row)),
                 trailing: IconButton(
-                  onPressed: () => _showStub(context),
+                  tooltip: 'Позвонить снова',
+                  onPressed: peerId == null
+                      ? null
+                      : () => _openCall(
+                            context,
+                            ref,
+                            peerId: peerId,
+                            peerName: peerName,
+                          ),
                   icon: const Icon(Icons.call),
                 ),
               );
@@ -85,21 +93,132 @@ class CallsListScreen extends ConsumerWidget {
         },
       ),
       floatingActionButton: FloatingActionButton(
-        onPressed: () => _showStub(context),
+        onPressed: () => _startNewCall(context, ref),
+        tooltip: 'Новый звонок',
         child: const Icon(Icons.add_call),
       ),
     );
   }
 
-  void _showStub(BuildContext context) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text(
-          'Голосовые и видеозвонки в разработке. '
-          'Опкоды реал-тайм медиа MAX пока не реверснуты.',
+  Future<void> _startNewCall(BuildContext context, WidgetRef ref) async {
+    try {
+      final contactsRepo = await ref.read(contactsRepositoryProvider.future);
+      final contacts = await contactsRepo.listLocal();
+      if (!context.mounted) return;
+      if (contacts.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Сначала добавьте хотя бы один контакт MAX во вкладке «Контакты».',
+            ),
+          ),
+        );
+        return;
+      }
+
+      contacts.sort((a, b) => _contactName(a).compareTo(_contactName(b)));
+      final selected = await showModalBottomSheet<MaxContact>(
+        context: context,
+        isScrollControlled: true,
+        builder: (sheetContext) => SafeArea(
+          child: SizedBox(
+            height: MediaQuery.of(sheetContext).size.height * 0.65,
+            child: Column(
+              children: [
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(16, 16, 16, 10),
+                  child: Text(
+                    'Кому позвонить?',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+                  ),
+                ),
+                const Divider(height: 1),
+                Expanded(
+                  child: ListView.separated(
+                    itemCount: contacts.length,
+                    separatorBuilder: (_, __) =>
+                        const Divider(height: 0, indent: 72),
+                    itemBuilder: (_, i) {
+                      final c = contacts[i];
+                      final name = _contactName(c);
+                      return ListTile(
+                        leading: CircleAvatar(
+                          child: Text(
+                            name.isNotEmpty ? name[0].toUpperCase() : '?',
+                          ),
+                        ),
+                        title: Text(name),
+                        subtitle: c.phone == null ? null : Text(c.phone!),
+                        trailing: const Icon(Icons.call_outlined),
+                        onTap: () => Navigator.of(sheetContext).pop(c),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+      if (!context.mounted || selected == null) return;
+      await _openCall(
+        context,
+        ref,
+        peerId: selected.id,
+        peerName: _contactName(selected),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Не удалось открыть список контактов: $e')),
+      );
+    }
+  }
+
+  Future<void> _openCall(
+    BuildContext context,
+    WidgetRef ref, {
+    required int peerId,
+    required String peerName,
+  }) async {
+    final result = await Navigator.of(context).push<MaxAudioCallResult>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => AudioCallScreen(
+          peerUserId: peerId,
+          peerName: peerName,
         ),
       ),
     );
+    if (result == null) return;
+
+    try {
+      final db = await ref.read(appDatabaseProvider.future);
+      await _ensureCallsTable(db);
+      await db.raw.insert('calls', <String, Object?>{
+        'peer_id': peerId,
+        'peer_name': peerName,
+        'direction': 'outgoing',
+        'missed': 0,
+        'started_at_ms': result.startedAtMs,
+        'duration_ms': result.durationMs,
+        'kind': 'audio',
+      });
+      ref.invalidate(_callsLogProvider);
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Звонок завершён, но журнал не сохранён: $e')),
+      );
+    }
+  }
+
+  static String _contactName(MaxContact c) {
+    final name = c.name?.trim();
+    if (name != null && name.isNotEmpty) return name;
+    final phone = c.phone?.trim();
+    if (phone != null && phone.isNotEmpty) return phone;
+    return 'Контакт ${c.id}';
   }
 
   String _formatCallRow(Map<String, Object?> row) {
@@ -123,8 +242,6 @@ class CallsListScreen extends ConsumerWidget {
   }
 }
 
-/// Локальная таблица звонков создаётся on-demand при первом обращении —
-/// чтобы не тащить миграцию ради заглушки.
 final _callsLogProvider =
     FutureProvider<List<Map<String, Object?>>>((ref) async {
   final db = await ref.watch(appDatabaseProvider.future);

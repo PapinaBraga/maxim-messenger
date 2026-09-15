@@ -1,0 +1,69 @@
+name: Build appinst for iOS 12
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/ios12-audio-calls
+    paths:
+      - '.github/workflows/build-appinst.yml'
+
+jobs:
+  build-appinst:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      THEOS: ${{ github.workspace }}/theos
+
+    steps:
+      - name: Checkout host repo
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install ldid dpkg
+
+      - name: Install Theos
+        run: git clone --recursive --depth=1 https://github.com/theos/theos.git "$THEOS"
+
+      - name: Clone official AppSync source
+        run: git clone --depth=1 --branch 116.0 https://github.com/akemin-dayo/AppSync.git AppSync
+
+      - name: Fetch static libzip used by official appinst build
+        run: |
+          # BigBoss currently serves this legacy package with an expired TLS cert.
+          # The URL is the one documented by the official appinst README.
+          curl -fkL --retry 4 --retry-delay 3 \
+            https://apt.thebigboss.org/repofiles/cydia/debs2.0/libzip_0.11.2.deb \
+            -o /tmp/libzip.deb
+          test "$(dpkg-deb -f /tmp/libzip.deb Package)" = "libzip"
+          test "$(dpkg-deb -f /tmp/libzip.deb Version)" = "0.11.2"
+          mkdir -p /tmp/libzip
+          dpkg-deb -x /tmp/libzip.deb /tmp/libzip
+          LIBZIP="$(find /tmp/libzip -name libzip.a -type f | head -1)"
+          test -n "$LIBZIP"
+          mkdir -p "$THEOS/lib"
+          cp "$LIBZIP" "$THEOS/lib/libzip.a"
+          ls -lh "$THEOS/lib/libzip.a"
+
+      - name: Build appinst arm64 for iOS 12
+        run: |
+          cd AppSync/appinst
+          sed -i '' 's/export TARGET = iphone:clang:latest:5.0/export TARGET = iphone:clang:latest:12.0/' Makefile
+          sed -i '' 's/export ARCHS = armv7 armv7s arm64/export ARCHS = arm64/' Makefile
+          make clean
+          make package FINALPACKAGE=1
+          find debs -type f -name '*.deb' -maxdepth 2 -print -exec ls -lh {} \;
+
+      - name: Collect appinst deb
+        run: |
+          DEB="$(find AppSync/appinst/debs -type f -name 'ai.akemi.appinst*.deb' | head -1)"
+          test -n "$DEB"
+          cp "$DEB" appinst-ios12-arm64.deb
+
+      - name: Upload appinst deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: appinst-ios12-arm64
+          path: appinst-ios12-arm64.deb
+          if-no-files-found: error
+          retention-days: 14
