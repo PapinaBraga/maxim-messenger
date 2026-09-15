@@ -11,6 +11,78 @@ def replace_once(old: str, new: str, label: str) -> None:
     text = text.replace(old, new, 1)
 
 
+# Keep the secondary OneMe/MAX transport alive for the entire call. The
+# reference call client does not tear this connection down immediately after
+# opcode 158; it remains open until the call ends.
+replace_once(
+    """  http.Client? _http;
+
+  String? _conversationId;""",
+    """  http.Client? _http;
+  _CallTokenClient? _callTokenClient;
+
+  String? _conversationId;""",
+    'call token client field insertion point',
+)
+
+replace_once(
+    """      final tokenClient = _CallTokenClient(logger: logger);
+      final callToken = await tokenClient.getCallToken(
+        authToken: savedToken,
+        deviceId: deviceId,
+        userAgent: userAgent,
+      );""",
+    """      _callTokenClient = _CallTokenClient(logger: logger);
+      final callToken = await _callTokenClient!.getCallToken(
+        authToken: savedToken,
+        deviceId: deviceId,
+        userAgent: userAgent,
+      );""",
+    'call token client creation block',
+)
+
+replace_once(
+    """      throw StateError('Call token отсутствует в ответе MAX');
+    } finally {
+      await _close();
+    }
+  }
+
+  Future<MaxFrame> _request""",
+    """      throw StateError('Call token отсутствует в ответе MAX');
+    } catch (_) {
+      await _close();
+      rethrow;
+    }
+  }
+
+  Future<void> close() => _close();
+
+  Future<MaxFrame> _request""",
+    'call token close lifecycle block',
+)
+
+replace_once(
+    """    try {
+      await Helper.setSpeakerphoneOn(false);
+    } catch (_) {}
+    _http?.close();
+    _http = null;""",
+    """    try {
+      await Helper.setSpeakerphoneOn(false);
+    } catch (_) {}
+
+    final callTokenClient = _callTokenClient;
+    _callTokenClient = null;
+    try {
+      await callTokenClient?.close();
+    } catch (_) {}
+
+    _http?.close();
+    _http = null;""",
+    'call token cleanup block',
+)
+
 replace_once(
     """      final ws = await WebSocket.connect(wsUri.toString())
           .timeout(const Duration(seconds: 20));""",
@@ -102,7 +174,7 @@ replace_once(
       });
       _emit(
         MaxAudioCallPhase.ringing,
-        'MAX: peer=$peerUserId, state=$peerState, participants=$participantCount\\nВызов отправлен…',
+        'MAX: peer=$peerUserId, state=$peerState, participants=$participantCount, oneMe=OPEN\\nВызов отправлен…',
       );""",
     'offer block',
 )
