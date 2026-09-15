@@ -32,7 +32,7 @@ jobs:
           p.write_text(text.replace('last_message_time_ms DESC NULLS LAST', 'last_message_time_ms DESC'))
           PY
 
-      - name: Patch MAX signaling to native protocol shape
+      - name: Patch MAX signaling to native protocol shape with diagnostics
         shell: bash
         run: |
           python3 - <<'PY'
@@ -50,6 +50,24 @@ jobs:
           if old_ws not in text:
               raise SystemExit('WebSocket connect block not found')
           text = text.replace(old_ws, new_ws, 1)
+
+          old_peer = """      _participantId = _findPeerParticipantId(hello, peerUserId);
+      if (_participantId == null) {
+        throw StateError('Собеседник не найден в signaling-сессии');
+      }
+
+      await _preparePeerConnection(start, hello);"""
+          new_peer = """      _participantId = _findPeerParticipantId(hello, peerUserId);
+      if (_participantId == null) {
+        throw StateError('Собеседник не найден в signaling-сессии');
+      }
+      final peerState = _findPeerParticipantState(hello, peerUserId) ?? 'UNKNOWN';
+      final participantCount = _participantCount(hello);
+
+      await _preparePeerConnection(start, hello);"""
+          if old_peer not in text:
+              raise SystemExit('peer lookup block not found')
+          text = text.replace(old_peer, new_peer, 1)
 
           old_candidate = """    pc.onIceCandidate = (candidate) {
       final value = candidate.candidate;
@@ -71,8 +89,6 @@ jobs:
         unawaited(_sendSignal(const <String, Object?>{'Candidate': ''}));
         return;
       }
-      // MAX signaling does not exchange browser-style SDP candidate objects.
-      // It transmits the raw ICE candidate in a `Candidate` field.
       unawaited(_sendSignal(<String, Object?>{'Candidate': value}));
     };"""
           if old_candidate not in text:
@@ -102,8 +118,6 @@ jobs:
       });
       await _pc!.setLocalDescription(offer);
 
-      // MAX uses its own signaling envelope. First transmit ICE credentials
-      // as {UFrag, Password}; candidates follow separately as {Candidate}.
       final localDescription = await _pc!.getLocalDescription();
       final localSdp = localDescription?.sdp ?? offer.sdp ?? '';
       final ufrag = _sdpAttribute(localSdp, 'ice-ufrag');
@@ -115,20 +129,68 @@ jobs:
         'UFrag': ufrag,
         'Password': password,
       });
-      _emit(MaxAudioCallPhase.ringing, 'Вызов отправлен…');"""
+      _emit(
+        MaxAudioCallPhase.ringing,
+        'MAX: peer=$peerUserId, state=$peerState, participants=$participantCount\nВызов отправлен…',
+      );"""
           if old_offer not in text:
               raise SystemExit('offer block not found')
           text = text.replace(old_offer, new_offer, 1)
 
-          marker = """  static String? _candidateUfrag(String candidate) {
+          marker = """  int? _findPeerParticipantId(Map<String, dynamic> hello, int externalId) {
+    final conversation = hello['conversation'];
+    if (conversation is! Map) return null;
+    final participants = conversation['participants'];
+    if (participants is! List) return null;
+    for (final item in participants) {
+      if (item is! Map) continue;
+      final external = item['externalId'];
+      if (external is! Map) continue;
+      if (external['id']?.toString() != '$externalId') continue;
+      final id = item['id'];
+      if (id is num) return id.toInt();
+      return int.tryParse(id?.toString() ?? '');
+    }
+    return null;
+  }
+"""
+          replacement = marker + """
+
+  String? _findPeerParticipantState(
+    Map<String, dynamic> hello,
+    int externalId,
+  ) {
+    final conversation = hello['conversation'];
+    if (conversation is! Map) return null;
+    final participants = conversation['participants'];
+    if (participants is! List) return null;
+    for (final item in participants) {
+      if (item is! Map) continue;
+      final external = item['externalId'];
+      if (external is! Map) continue;
+      if (external['id']?.toString() != '$externalId') continue;
+      return item['state']?.toString();
+    }
+    return null;
+  }
+
+  int _participantCount(Map<String, dynamic> hello) {
+    final conversation = hello['conversation'];
+    if (conversation is! Map) return 0;
+    final participants = conversation['participants'];
+    return participants is List ? participants.length : 0;
+  }
+"""
+          if marker not in text:
+              raise SystemExit('participant helper insertion point not found')
+          text = text.replace(marker, replacement, 1)
+
+          helper_marker = """  static String? _candidateUfrag(String candidate) {
     final m = RegExp(r'(?:^|\\s)ufrag\\s+([^\\s]+)').firstMatch(candidate);
     return m?.group(1);
   }
 """
-          replacement = """  static String? _candidateUfrag(String candidate) {
-    final m = RegExp(r'(?:^|\\s)ufrag\\s+([^\\s]+)').firstMatch(candidate);
-    return m?.group(1);
-  }
+          helper_replacement = helper_marker + """
 
   static String? _sdpAttribute(String sdp, String name) {
     final m = RegExp('^a=' + RegExp.escape(name) + r':([^\\r\\n]+)', multiLine: true)
@@ -136,9 +198,9 @@ jobs:
     return m?.group(1)?.trim();
   }
 """
-          if marker not in text:
-              raise SystemExit('helper insertion point not found')
-          text = text.replace(marker, replacement, 1)
+          if helper_marker not in text:
+              raise SystemExit('SDP helper insertion point not found')
+          text = text.replace(helper_marker, helper_replacement, 1)
 
           p.write_text(text)
           PY
