@@ -1,0 +1,202 @@
+name: iOS 12 call signaling test IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/ios12-audio-calls
+
+jobs:
+  build-ios12-calltest:
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter 3.29.3
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.3'
+          channel: stable
+          cache: true
+
+      - name: Patch SQLite syntax for iOS 12
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('lib/data/local/database.dart')
+          text = p.read_text()
+          p.write_text(text.replace('last_message_time_ms DESC NULLS LAST', 'last_message_time_ms DESC'))
+          PY
+
+      - name: Patch MAX signaling to native protocol shape
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('lib/data/calls/max_audio_call.dart')
+          text = p.read_text()
+
+          old_ws = """      final ws = await WebSocket.connect(wsUri.toString())
+          .timeout(const Duration(seconds: 20));"""
+          new_ws = """      final ws = await WebSocket.connect(
+        wsUri.toString(),
+        headers: const <String, dynamic>{'Origin': 'https://web.max.ru'},
+      ).timeout(const Duration(seconds: 20));"""
+          if old_ws not in text:
+              raise SystemExit('WebSocket connect block not found')
+          text = text.replace(old_ws, new_ws, 1)
+
+          old_candidate = """    pc.onIceCandidate = (candidate) {
+      final value = candidate.candidate;
+      if (value == null || value.isEmpty || _finished) return;
+      final ufrag = _candidateUfrag(value);
+      unawaited(_sendSignal(<String, Object?>{
+        'candidate': <String, Object?>{
+          'candidate': value,
+          'sdpMid': candidate.sdpMid,
+          'sdpMLineIndex': candidate.sdpMLineIndex,
+          if (ufrag != null) 'usernameFragment': ufrag,
+        },
+      }));
+    };"""
+          new_candidate = """    pc.onIceCandidate = (candidate) {
+      if (_finished) return;
+      final value = candidate.candidate;
+      if (value == null || value.isEmpty) {
+        unawaited(_sendSignal(const <String, Object?>{'Candidate': ''}));
+        return;
+      }
+      // MAX signaling does not exchange browser-style SDP candidate objects.
+      // It transmits the raw ICE candidate in a `Candidate` field.
+      unawaited(_sendSignal(<String, Object?>{'Candidate': value}));
+    };"""
+          if old_candidate not in text:
+              raise SystemExit('ICE candidate block not found')
+          text = text.replace(old_candidate, new_candidate, 1)
+
+          old_offer = """      final offer = await _pc!.createOffer(<String, dynamic>{
+        'mandatory': <String, dynamic>{
+          'OfferToReceiveAudio': true,
+          'OfferToReceiveVideo': false,
+        },
+        'optional': <dynamic>[],
+      });
+      await _pc!.setLocalDescription(offer);
+      await _sendSignal(<String, Object?>{
+        'sdp': <String, Object?>{
+          'type': offer.type,
+          'sdp': offer.sdp,
+        },
+      });"""
+          new_offer = """      final offer = await _pc!.createOffer(<String, dynamic>{
+        'mandatory': <String, dynamic>{
+          'OfferToReceiveAudio': true,
+          'OfferToReceiveVideo': false,
+        },
+        'optional': <dynamic>[],
+      });
+      await _pc!.setLocalDescription(offer);
+
+      // MAX uses its own signaling envelope. First transmit ICE credentials
+      // as {UFrag, Password}; candidates follow separately as {Candidate}.
+      final localDescription = await _pc!.getLocalDescription();
+      final localSdp = localDescription?.sdp ?? offer.sdp ?? '';
+      final ufrag = _sdpAttribute(localSdp, 'ice-ufrag');
+      final password = _sdpAttribute(localSdp, 'ice-pwd');
+      if (ufrag == null || password == null) {
+        throw StateError('Не удалось получить ICE credentials');
+      }
+      await _sendSignal(<String, Object?>{
+        'UFrag': ufrag,
+        'Password': password,
+      });
+      _emit(MaxAudioCallPhase.ringing, 'Вызов отправлен…');"""
+          if old_offer not in text:
+              raise SystemExit('offer block not found')
+          text = text.replace(old_offer, new_offer, 1)
+
+          marker = """  static String? _candidateUfrag(String candidate) {
+    final m = RegExp(r'(?:^|\\s)ufrag\\s+([^\\s]+)').firstMatch(candidate);
+    return m?.group(1);
+  }
+"""
+          replacement = """  static String? _candidateUfrag(String candidate) {
+    final m = RegExp(r'(?:^|\\s)ufrag\\s+([^\\s]+)').firstMatch(candidate);
+    return m?.group(1);
+  }
+
+  static String? _sdpAttribute(String sdp, String name) {
+    final m = RegExp('^a=' + RegExp.escape(name) + r':([^\\r\\n]+)', multiLine: true)
+        .firstMatch(sdp);
+    return m?.group(1)?.trim();
+  }
+"""
+          if marker not in text:
+              raise SystemExit('helper insertion point not found')
+          text = text.replace(marker, replacement, 1)
+
+          p.write_text(text)
+          PY
+
+      - name: Flutter dependencies
+        run: flutter pub get
+
+      - name: CocoaPods dependencies
+        run: |
+          cd ios
+          pod install --repo-update
+
+      - name: Build iOS without Apple signing
+        run: flutter build ios --release --no-codesign
+
+      - name: Add ad-hoc signature and application identifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          cat > /tmp/maxim-entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>application-identifier</key>
+            <string>one.maxim.maximMessenger</string>
+            <key>get-task-allow</key>
+            <false/>
+          </dict>
+          </plist>
+          EOF
+
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -type d -name '*.framework' -print0 | while IFS= read -r -d '' item; do
+              /usr/bin/codesign --force --sign - --timestamp=none "$item"
+            done
+            find "$APP/Frameworks" -type f -name '*.dylib' -print0 | while IFS= read -r -d '' item; do
+              /usr/bin/codesign --force --sign - --timestamp=none "$item"
+            done
+          fi
+
+          /usr/bin/codesign --force --sign - --timestamp=none --entitlements /tmp/maxim-entitlements.plist "$APP"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Pack IPA
+        shell: bash
+        run: |
+          rm -rf Payload Maxim-iOS12-calltest.ipa
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qry Maxim-iOS12-calltest.ipa Payload
+          ls -lh Maxim-iOS12-calltest.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Maxim-iOS12-calltest
+          path: Maxim-iOS12-calltest.ipa
+          if-no-files-found: error
+          retention-days: 14
